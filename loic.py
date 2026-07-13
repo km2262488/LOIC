@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # LOIC Installer for Termux (Android)
-# Adapted from original script
+# Adapted for Termux environment
 
 import os
 import sys
 import subprocess
 import shutil
-import platform
 from pathlib import Path
 
 # Constants
@@ -15,11 +14,37 @@ GIT_BRANCH = "master"
 
 # Termux paths
 HOME = Path(os.environ.get("HOME", "/data/data/com.termux/files/home"))
-LOIC_DIR = HOME / "LOIC"
-SRC_DIR = LOIC_DIR / "src"
-EXE_PATH = SRC_DIR / "bin" / "Debug" / "LOIC.exe"
-CONFIG_PATH = SRC_DIR / "bin" / "Debug" / "LOIC.exe.config"
-APP_CONFIG_PATH = SRC_DIR / "app.config"
+LOIC_BASE = HOME / "LOIC"
+
+def find_loic_src():
+    """Find the actual LOIC src directory"""
+    possible_paths = [
+        LOIC_BASE / "src",
+        LOIC_BASE / "LOIC" / "src",
+        LOIC_BASE / "LOIC" / "LOIC" / "src",
+    ]
+    
+    for path in possible_paths:
+        if path.exists() and (path / "LOIC.sln").exists():
+            return path
+    return None
+
+def find_exe_path(src_dir):
+    """Find the LOIC executable path"""
+    if src_dir is None:
+        return None
+    
+    possible_exe = [
+        src_dir / "bin" / "Debug" / "LOIC.exe",
+        src_dir / "bin" / "Release" / "LOIC.exe",
+        src_dir / "LOIC" / "bin" / "Debug" / "LOIC.exe",
+        src_dir / "LOIC" / "bin" / "Release" / "LOIC.exe",
+    ]
+    
+    for exe in possible_exe:
+        if exe.exists():
+            return exe
+    return possible_exe[0]  # Return default path
 
 def run_command(cmd, check=False, capture=False):
     """Run a shell command"""
@@ -42,204 +67,260 @@ def detect_termux():
     """Check if running in Termux"""
     return "com.termux" in os.environ.get("PREFIX", "")
 
+def install_package(pkg):
+    """Install package in Termux"""
+    print(f"Installing {pkg}...")
+    run_command(f"pkg install -y {pkg}")
+
 def check_dependencies():
     """Check and install dependencies for Termux"""
     print("Checking dependencies for Termux...")
     
+    # Update package list
+    run_command("pkg update")
+    
     # Install required packages
-    packages = ["git", "mono", "msbuild"]
+    packages = ["git", "mono", "msbuild", "mono-msbuild"]
+    
     for pkg in packages:
         if not which(pkg):
-            print(f"Installing {pkg}...")
-            run_command(f"pkg install -y {pkg}")
+            install_package(pkg)
     
-    # Check for xbuild (might be needed instead of msbuild)
+    # Check if we have build tools
     if not which("msbuild") and not which("xbuild"):
         print("Installing mono-msbuild...")
-        run_command("pkg install -y mono-msbuild")
+        install_package("mono-msbuild")
+        install_package("mono")
     
     print("Dependencies check complete.")
 
 def is_loic():
     """Check if LOIC repository exists"""
-    if LOIC_DIR.exists() and (LOIC_DIR / ".git").exists():
-        try:
-            result = run_command("git config --local --get remote.origin.url", capture=True)
-            return result and "LOIC" in result
-        except:
-            return False
+    # Check both possible locations
+    if (LOIC_BASE / ".git").exists():
+        return True
+    if (LOIC_BASE / "LOIC" / ".git").exists():
+        return True
     return False
 
 def get_loic():
     """Clone LOIC repository"""
     if not which("git"):
-        print("Installing git...")
-        run_command("pkg install -y git")
+        install_package("git")
     
-    if not is_loic():
-        print(f"Cloning LOIC from {GIT_REPO}...")
-        run_command(f"git clone {GIT_REPO} -b {GIT_BRANCH}")
-    else:
+    if is_loic():
         print("LOIC already exists.")
+        return
+    
+    print(f"Cloning LOIC from {GIT_REPO}...")
+    os.chdir(HOME)
+    run_command(f"git clone {GIT_REPO} -b {GIT_BRANCH}")
+    
+    # Check if cloned successfully
+    if not is_loic():
+        print("Error: Failed to clone LOIC repository.")
+        return False
+    
+    # Find and show the structure
+    src_dir = find_loic_src()
+    if src_dir:
+        print(f"Found LOIC source at: {src_dir}")
+    else:
+        print("Warning: LOIC source directory not found.")
+    
+    return True
 
 def compile_loic():
     """Compile LOIC for Termux"""
+    # Get LOIC first
     get_loic()
     
-    if not is_loic():
-        print("Error: LOIC repository not found.")
+    # Find src directory
+    src_dir = find_loic_src()
+    if not src_dir:
+        print("Error: Could not find LOIC source directory.")
+        print("Looking in:", LOIC_BASE)
+        print("Contents:", list(LOIC_BASE.glob("**/*.sln")))
         return False
     
-    # Try msbuild first, fallback to xbuild
-    build_tool = None
+    print(f"Compiling LOIC in: {src_dir}")
+    os.chdir(src_dir.parent if src_dir.parent != src_dir else src_dir)
+    
+    # Try different build tools
+    build_tools = []
     if which("msbuild"):
-        build_tool = "msbuild"
-    elif which("xbuild"):
-        build_tool = "xbuild"
-    else:
-        print("Error: Neither msbuild nor xbuild found.")
-        print("Installing msbuild...")
-        run_command("pkg install -y mono-msbuild")
+        build_tools.append("msbuild")
+    if which("xbuild"):
+        build_tools.append("xbuild")
+    
+    if not build_tools:
+        print("Installing build tools...")
+        install_package("mono-msbuild")
         if which("msbuild"):
-            build_tool = "msbuild"
+            build_tools.append("msbuild")
         else:
+            print("Error: No build tool available.")
             return False
     
-    print(f"Compiling LOIC using {build_tool}...")
-    os.chdir(SRC_DIR)
-    
-    # Try different build commands
-    build_commands = [
-        f"{build_tool} /p:TargetFrameworkVersion='v4.0'",
-        f"{build_tool} /p:Configuration=Debug",
-        f"{build_tool}",
-    ]
-    
     success = False
-    for cmd in build_commands:
-        print(f"Trying: {cmd}")
-        result = run_command(cmd)
-        if EXE_PATH.exists():
-            success = True
+    for tool in build_tools:
+        print(f"Trying {tool}...")
+        
+        # Try different build commands
+        commands = [
+            f"{tool} /p:TargetFrameworkVersion=v4.0 /p:Configuration=Debug",
+            f"{tool} /p:Configuration=Debug",
+            f"{tool} /p:TargetFrameworkVersion=v4.0",
+            f"{tool}",
+        ]
+        
+        for cmd in commands:
+            print(f"  Running: {cmd}")
+            run_command(cmd)
+            
+            # Check if exe was created
+            exe_path = find_exe_path(src_dir)
+            if exe_path and exe_path.exists():
+                print(f"✅ Compilation successful! EXE found at: {exe_path}")
+                success = True
+                break
+        
+        if success:
             break
     
-    os.chdir(HOME)
+    if not success:
+        print("❌ Compilation failed. Trying fallback method...")
+        success = compile_loic_fallback(src_dir)
     
-    if success:
-        print("Compilation successful!")
-        return True
-    else:
-        print("Compilation failed. Trying alternative method...")
-        return compile_loic_alternative()
+    return success
 
-def compile_loic_alternative():
-    """Alternative compilation method for Termux"""
-    print("Attempting alternative compilation...")
+def compile_loic_fallback(src_dir):
+    """Fallback compilation using mcs/dmcs directly"""
+    print("Using fallback compilation method...")
     
-    # Try using dmcs directly
-    cs_files = list(SRC_DIR.glob("**/*.cs"))
+    # Find all .cs files
+    cs_files = list(src_dir.glob("**/*.cs"))
     if not cs_files:
-        print("No C# files found.")
+        print("No .cs files found.")
         return False
     
-    # Compile all CS files directly
-    references = [
+    # Check for compiler
+    compiler = None
+    for cmd in ["dmcs", "mcs", "csc"]:
+        if which(cmd):
+            compiler = cmd
+            break
+    
+    if not compiler:
+        print("No C# compiler found.")
+        return False
+    
+    # Compile all files
+    output_path = src_dir / "LOIC.exe"
+    refs = [
         "System.dll",
-        "System.Windows.Forms.dll",
+        "System.Windows.Forms.dll", 
         "System.Drawing.dll",
         "System.Net.dll",
         "System.Xml.dll"
     ]
     
-    ref_args = " ".join([f"-r:{ref}" for ref in references])
-    output = str(EXE_PATH)
+    ref_args = " ".join([f"-r:{ref}" for ref in refs])
+    cs_files_str = " ".join([str(f) for f in cs_files])
     
-    os.chdir(SRC_DIR)
-    cmd = f"dmcs -target:winexe -out:{output} {ref_args} {SRC_DIR}/**/*.cs"
+    cmd = f"{compiler} -target:winexe -out:{output_path} {ref_args} {cs_files_str}"
     print(f"Running: {cmd}")
     
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    os.chdir(HOME)
     
-    if EXE_PATH.exists():
-        print("Alternative compilation successful!")
+    if output_path.exists():
+        print(f"✅ Fallback compilation successful! EXE at: {output_path}")
         return True
     else:
-        print("Alternative compilation failed.")
-        print("Error output:", result.stderr)
+        print("❌ Fallback compilation failed.")
+        print("Error:", result.stderr[:500])
         return False
 
 def run_loic():
     """Run LOIC application"""
     if not which("mono"):
         print("Mono not found. Installing...")
-        run_command("pkg install -y mono")
+        install_package("mono")
     
-    if not is_loic():
-        print("LOIC not found. Cloning...")
+    # Find source and exe
+    src_dir = find_loic_src()
+    if not src_dir:
+        print("LOIC not found. Installing...")
         get_loic()
-        compile_loic()
+        src_dir = find_loic_src()
+        if not src_dir:
+            print("Error: Could not find LOIC.")
+            return
     
-    if not EXE_PATH.exists():
+    exe_path = find_exe_path(src_dir)
+    if not exe_path or not exe_path.exists():
         print("LOIC executable not found. Compiling...")
-        compile_loic()
+        if not compile_loic():
+            print("Error: Compilation failed.")
+            return
+        exe_path = find_exe_path(src_dir)
     
-    if not EXE_PATH.exists():
-        print("Error: Could not compile LOIC.")
-        print("Checking for pre-compiled version...")
-        check_precompiled()
+    if not exe_path or not exe_path.exists():
+        print("Error: Could not find LOIC executable.")
         return
     
-    # Copy config file if needed
-    if APP_CONFIG_PATH.exists() and not CONFIG_PATH.exists():
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(APP_CONFIG_PATH, CONFIG_PATH)
-        print(f"Copied config to {CONFIG_PATH}")
+    print(f"Running LOIC from: {exe_path}")
+    os.chdir(exe_path.parent)
     
-    print("Running LOIC...")
-    print("Note: LOIC may have limited functionality in Termux.")
-    print("Press Ctrl+C to stop.")
+    # Copy config if needed
+    config_src = src_dir / "app.config"
+    config_dst = exe_path.parent / "LOIC.exe.config"
+    if config_src.exists() and not config_dst.exists():
+        shutil.copy2(config_src, config_dst)
+        print(f"Copied config to {config_dst}")
     
-    os.chdir(EXE_PATH.parent)
+    print("\n" + "="*50)
+    print("Starting LOIC...")
+    print("Press Ctrl+C to stop")
+    print("="*50 + "\n")
+    
     try:
-        # Try different mono runtime versions
-        run_commands = [
-            "mono --runtime=v4.0.30319 LOIC.exe",
-            "mono LOIC.exe"
+        # Try with different mono runtime versions
+        commands = [
+            f"mono --runtime=v4.0.30319 {exe_path.name}",
+            f"mono {exe_path.name}"
         ]
         
-        for cmd in run_commands:
-            print(f"Trying: {cmd}")
+        for cmd in commands:
+            print(f"Running: {cmd}")
             result = subprocess.run(cmd, shell=True)
             if result.returncode == 0:
                 break
+            
     except KeyboardInterrupt:
-        print("\nLOIC stopped.")
+        print("\n\nLOIC stopped.")
+    except Exception as e:
+        print(f"Error running LOIC: {e}")
     finally:
         os.chdir(HOME)
 
-def check_precompiled():
-    """Check if there's a pre-compiled version available"""
-    # Try to find any .exe file in the repository
-    exe_files = list(LOIC_DIR.glob("**/*.exe"))
-    if exe_files:
-        print(f"Found pre-compiled executable: {exe_files[0]}")
-        print("You can try running it manually with:")
-        print(f"mono {exe_files[0]}")
-    else:
-        print("No pre-compiled executables found.")
-        print("LOIC may not be compatible with Termux environment.")
-
 def update_loic():
     """Update LOIC from repository"""
-    if is_loic():
-        print("Updating LOIC...")
-        os.chdir(LOIC_DIR)
+    # Find the git repo
+    git_dir = None
+    if (LOIC_BASE / ".git").exists():
+        git_dir = LOIC_BASE
+    elif (LOIC_BASE / "LOIC" / ".git").exists():
+        git_dir = LOIC_BASE / "LOIC"
+    
+    if git_dir:
+        print(f"Updating LOIC at {git_dir}...")
+        os.chdir(git_dir)
         run_command("git pull --rebase")
         os.chdir(HOME)
         compile_loic()
     else:
-        print("Error: LOIC repository not found.")
+        print("LOIC repository not found. Cloning...")
         get_loic()
         compile_loic()
 
@@ -273,15 +354,16 @@ def main():
     command = sys.argv[1].lower()
     
     if command == "install":
-        print("Installing LOIC for Termux...")
+        print("📦 Installing LOIC for Termux...")
         check_dependencies()
-        get_loic()
-        compile_loic()
-        if EXE_PATH.exists():
-            print("Installation successful!")
+        if compile_loic():
+            print("\n✅ Installation successful!")
             print("Run with: python3 loic.py run")
         else:
-            print("Installation failed. Please check errors above.")
+            print("\n❌ Installation failed.")
+            print("Please check errors above.")
+            print("You may need to install mono manually:")
+            print("  pkg install mono mono-msbuild")
             
     elif command == "update":
         update_loic()
