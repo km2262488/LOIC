@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bufio"
 	"bytes"
 	"fmt"
 	"io"
