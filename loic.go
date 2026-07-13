@@ -53,6 +53,8 @@ func main() {
 		updateLOIC()
 	case "run":
 		runLOIC()
+	case "clean":
+		cleanLOIC()
 	default:
 		fmt.Printf("Unknown command: %s\n", command)
 		printUsage()
@@ -64,12 +66,13 @@ func printUsage() {
 	fmt.Println("LOIC Installer for Linux/Termux")
 	fmt.Println(strings.Repeat("=", 40))
 	fmt.Println()
-	fmt.Println("Usage: go run loic.go <install|update|run>")
+	fmt.Println("Usage: go run loic.go <install|update|run|clean>")
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  install  - Install LOIC and dependencies")
 	fmt.Println("  update   - Update LOIC to latest version")
 	fmt.Println("  run      - Run LOIC application")
+	fmt.Println("  clean    - Remove LOIC directory")
 	fmt.Println()
 	fmt.Println("Note: This script is optimized for Linux and Termux")
 }
@@ -133,6 +136,12 @@ func checkDependencies() {
 				runCommand("pkg", "install", "-y", pkg)
 			}
 		}
+		
+		// Check if we have mcs
+		if !which("mcs") && !which("dmcs") {
+			fmt.Println("Installing mono development tools...")
+			runCommand("pkg", "install", "-y", "mono-tools")
+		}
 	} else {
 		// Linux dependencies
 		fmt.Println("Detected Linux environment")
@@ -153,6 +162,7 @@ func checkDependencies() {
 				"mono-runtime",
 				"libmono-system-windows-forms4.0-cil",
 				"monodevelop",
+				"mono-mcs",
 			}
 		case "fedora":
 			installCmd = "dnf"
@@ -178,7 +188,7 @@ func checkDependencies() {
 		
 		// Install packages with sudo
 		for _, pkg := range packages {
-			if !which(pkg) && pkg != "monodevelop" && pkg != "mono-tools" {
+			if !which(pkg) && pkg != "monodevelop" && pkg != "mono-tools" && pkg != "mono-mcs" {
 				fmt.Printf("Installing %s...\n", pkg)
 				runCommand("sudo", installCmd, "install", "-y", pkg)
 			}
@@ -220,11 +230,16 @@ func detectDistro() string {
 }
 
 func isLOIC() bool {
-	if _, err := os.Stat(filepath.Join(loicDir, ".git")); err == nil {
-		return true
+	// Check multiple possible locations
+	possibleDirs := []string{
+		loicDir,
+		filepath.Join(loicDir, "LOIC"),
 	}
-	if _, err := os.Stat(filepath.Join(loicDir, "LOIC", ".git")); err == nil {
-		return true
+	
+	for _, dir := range possibleDirs {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return true
+		}
 	}
 	return false
 }
@@ -232,17 +247,23 @@ func isLOIC() bool {
 func getLOIC() error {
 	fmt.Println("Cloning LOIC repository...")
 	
+	// Remove existing directory if it's empty
+	if _, err := os.Stat(loicDir); err == nil {
+		// Check if directory is empty
+		entries, _ := os.ReadDir(loicDir)
+		if len(entries) == 0 {
+			fmt.Println("Removing empty LOIC directory...")
+			os.RemoveAll(loicDir)
+		}
+	}
+	
 	if isLOIC() {
 		fmt.Println("LOIC already exists.")
 		return nil
 	}
 	
 	// Try git clone
-	cmd := fmt.Sprintf("git clone %s -b %s", gitRepo, gitBranch)
-	if isTermux() {
-		cmd = fmt.Sprintf("git clone %s -b %s", gitRepo, gitBranch)
-	}
-	
+	cmd := fmt.Sprintf("git clone %s -b %s %s", gitRepo, gitBranch, loicDir)
 	_, err := runCommandShell(cmd)
 	if err != nil {
 		return fmt.Errorf("failed to clone repository: %v", err)
@@ -264,6 +285,19 @@ func findSrcDir() string {
 		}
 	}
 	
+	// Try to find any .sln file
+	var slnFiles []string
+	filepath.Walk(loicDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".sln") {
+			slnFiles = append(slnFiles, filepath.Dir(path))
+		}
+		return nil
+	})
+	
+	if len(slnFiles) > 0 {
+		return slnFiles[0]
+	}
+	
 	return ""
 }
 
@@ -276,12 +310,26 @@ func findExePath(srcDir string) string {
 		filepath.Join(srcDir, "bin", "Debug", "LOIC.exe"),
 		filepath.Join(srcDir, "bin", "Release", "LOIC.exe"),
 		filepath.Join(srcDir, "LOIC.exe"),
+		filepath.Join(srcDir, "bin", "Debug", "LOIC", "LOIC.exe"),
 	}
 	
 	for _, exe := range possibleExe {
 		if _, err := os.Stat(exe); err == nil {
 			return exe
 		}
+	}
+	
+	// Search for any .exe file
+	var exeFiles []string
+	filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".exe") {
+			exeFiles = append(exeFiles, path)
+		}
+		return nil
+	})
+	
+	if len(exeFiles) > 0 {
+		return exeFiles[0]
 	}
 	
 	return possibleExe[0]
@@ -316,7 +364,8 @@ func compileLOIC() error {
 	}{
 		{"MSBuild", "msbuild /p:TargetFrameworkVersion=v4.0 /p:Configuration=Debug"},
 		{"XBuild", "xbuild /p:TargetFrameworkVersion=v4.0"},
-		{"MCS/Direct", "mcs -target:winexe -out:LOIC.exe *.cs -r:System.Windows.Forms.dll -r:System.dll -r:System.Drawing.dll"},
+		{"MCS Direct", "mcs -target:winexe -out:LOIC.exe *.cs -r:System.Windows.Forms.dll -r:System.dll -r:System.Drawing.dll"},
+		{"DMCS Direct", "dmcs -target:winexe -out:LOIC.exe *.cs -r:System.Windows.Forms.dll -r:System.dll -r:System.Drawing.dll"},
 	}
 	
 	for _, method := range compileMethods {
@@ -344,38 +393,46 @@ func compileLOIC() error {
 		}
 	}
 	
-	// Try direct compilation with mcs on all .cs files
-	fmt.Println("Trying full compilation with mcs...")
+	// Try recursive compilation
+	fmt.Println("Trying recursive compilation with mcs...")
 	
 	// Find all .cs files
-	pattern := "*.cs"
-	matches, err := filepath.Glob(filepath.Join(srcDir, "**", pattern))
-	if err == nil && len(matches) > 0 {
-		var csFiles []string
-		for _, match := range matches {
-			if !strings.Contains(match, "bin") && !strings.Contains(match, "obj") {
-				csFiles = append(csFiles, match)
+	var csFiles []string
+	filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() && strings.HasSuffix(path, ".cs") {
+			// Skip bin and obj directories
+			if !strings.Contains(path, "bin") && !strings.Contains(path, "obj") {
+				csFiles = append(csFiles, path)
 			}
 		}
+		return nil
+	})
+	
+	if len(csFiles) > 0 {
+		fmt.Printf("Found %d .cs files\n", len(csFiles))
 		
-		if len(csFiles) > 0 {
-			args := []string{
-				"-target:winexe",
-				"-out:LOIC.exe",
-				"-r:System.Windows.Forms.dll",
-				"-r:System.dll",
-				"-r:System.Drawing.dll",
-				"-r:System.Net.dll",
-				"-r:System.Xml.dll",
-			}
-			args = append(args, csFiles...)
-			
-			_, err := runCommand("mcs", args...)
-			if err == nil {
-				exePath := filepath.Join(srcDir, "LOIC.exe")
-				if _, err := os.Stat(exePath); err == nil {
-					fmt.Printf("✅ Compilation successful! EXE: %s\n", exePath)
-					return nil
+		// Try with mcs or dmcs
+		compilers := []string{"mcs", "dmcs"}
+		for _, compiler := range compilers {
+			if which(compiler) {
+				args := []string{
+					"-target:winexe",
+					"-out:LOIC.exe",
+					"-r:System.Windows.Forms.dll",
+					"-r:System.dll",
+					"-r:System.Drawing.dll",
+					"-r:System.Net.dll",
+					"-r:System.Xml.dll",
+				}
+				args = append(args, csFiles...)
+				
+				_, err := runCommand(compiler, args...)
+				if err == nil {
+					exePath := filepath.Join(srcDir, "LOIC.exe")
+					if _, err := os.Stat(exePath); err == nil {
+						fmt.Printf("✅ Compilation successful! EXE: %s\n", exePath)
+						return nil
+					}
 				}
 			}
 		}
@@ -384,80 +441,118 @@ func compileLOIC() error {
 	return fmt.Errorf("all compilation methods failed")
 }
 
-func downloadLOICZip() error {
-	fmt.Println("Downloading pre-compiled LOIC...")
+func downloadLOICFromGit() error {
+	fmt.Println("Downloading LOIC from git (without compilation)...")
 	
-	// Try to get latest release
-	url := "https://github.com/NewEraCracker/LOIC/releases/latest/download/LOIC.zip"
-	zipPath := filepath.Join(homeDir, "LOIC.zip")
-	
-	// Download
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("download failed: %v", err)
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed with status: %s", resp.Status)
-	}
-	
-	// Create file
-	out, err := os.Create(zipPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	
-	// Copy data
-	_, err = io.Copy(out, resp.Body)
-	if err != nil {
+	if err := getLOIC(); err != nil {
 		return err
 	}
 	
-	fmt.Printf("Downloaded to: %s\n", zipPath)
-	
-	// Extract
-	fmt.Println("Extracting...")
-	os.MkdirAll(loicDir, 0755)
-	
-	reader, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
+	// Check if there's a pre-built binary in the repository
+	srcDir := findSrcDir()
+	if srcDir == "" {
+		return fmt.Errorf("source directory not found")
 	}
-	defer reader.Close()
 	
-	for _, file := range reader.File {
-		path := filepath.Join(loicDir, file.Name)
+	// Look for any .exe
+	exePath := findExePath(srcDir)
+	if _, err := os.Stat(exePath); err == nil {
+		fmt.Printf("✅ Found pre-built executable: %s\n", exePath)
+		return nil
+	}
+	
+	// Try to download from releases
+	repos := []string{
+		"https://github.com/NewEraCracker/LOIC/releases/download/1.0.8/LOIC.zip",
+		"https://github.com/NewEraCracker/LOIC/releases/download/v1.0.8/LOIC.zip",
+	}
+	
+	for _, url := range repos {
+		fmt.Printf("Trying to download: %s\n", url)
+		zipPath := filepath.Join(homeDir, "LOIC_download.zip")
 		
-		if file.FileInfo().IsDir() {
-			os.MkdirAll(path, 0755)
-			continue
-		}
-		
-		dir := filepath.Dir(path)
-		os.MkdirAll(dir, 0755)
-		
-		src, err := file.Open()
+		// Download
+		resp, err := http.Get(url)
 		if err != nil {
 			continue
 		}
-		defer src.Close()
+		defer resp.Body.Close()
 		
-		dst, err := os.Create(path)
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+		
+		// Create file
+		out, err := os.Create(zipPath)
 		if err != nil {
 			continue
 		}
-		defer dst.Close()
+		defer out.Close()
 		
-		io.Copy(dst, src)
+		// Copy data
+		_, err = io.Copy(out, resp.Body)
+		if err != nil {
+			continue
+		}
+		
+		// Extract
+		fmt.Println("Extracting...")
+		os.RemoveAll(loicDir)
+		os.MkdirAll(loicDir, 0755)
+		
+		reader, err := zip.OpenReader(zipPath)
+		if err != nil {
+			os.Remove(zipPath)
+			continue
+		}
+		defer reader.Close()
+		
+		for _, file := range reader.File {
+			path := filepath.Join(loicDir, file.Name)
+			
+			if file.FileInfo().IsDir() {
+				os.MkdirAll(path, 0755)
+				continue
+			}
+			
+			dir := filepath.Dir(path)
+			os.MkdirAll(dir, 0755)
+			
+			src, err := file.Open()
+			if err != nil {
+				continue
+			}
+			defer src.Close()
+			
+			dst, err := os.Create(path)
+			if err != nil {
+				continue
+			}
+			defer dst.Close()
+			
+			io.Copy(dst, src)
+		}
+		
+		os.Remove(zipPath)
+		fmt.Println("✅ Download and extraction complete")
+		
+		// Check if we have an executable
+		exe := findExePath(findSrcDir())
+		if _, err := os.Stat(exe); err == nil {
+			return nil
+		}
 	}
 	
-	// Clean up
-	os.Remove(zipPath)
-	fmt.Println("✅ Extraction complete")
-	
-	return nil
+	return fmt.Errorf("no pre-built version found")
+}
+
+func cleanLOIC() {
+	fmt.Printf("Removing LOIC directory: %s\n", loicDir)
+	if err := os.RemoveAll(loicDir); err != nil {
+		fmt.Printf("Error removing directory: %v\n", err)
+	} else {
+		fmt.Println("✅ LOIC directory removed")
+	}
 }
 
 func installLOIC() {
@@ -470,34 +565,42 @@ func installLOIC() {
 		name string
 		fn   func() error
 	}{
-		{"Download pre-compiled", downloadLOICZip},
+		{"Download from Git releases", downloadLOICFromGit},
 		{"Build from source", compileLOIC},
 	}
 	
+	success := false
 	for _, method := range methods {
 		fmt.Printf("\n🔧 Trying: %s\n", method.name)
 		if err := method.fn(); err == nil {
 			// Check if we have an executable
-			exe := findExePath(findSrcDir())
-			if _, err := os.Stat(exe); err == nil {
-				fmt.Printf("\n✅ Installation successful!\n")
-				fmt.Printf("📁 LOIC installed at: %s\n", loicDir)
-				fmt.Printf("📄 Executable: %s\n", exe)
-				fmt.Printf("\nRun with: go run loic.go run\n")
-				return
-			} else {
-				fmt.Println("⚠️  Installation completed but no executable found")
+			srcDir := findSrcDir()
+			if srcDir != "" {
+				exe := findExePath(srcDir)
+				if _, err := os.Stat(exe); err == nil {
+					fmt.Printf("\n✅ Installation successful!\n")
+					fmt.Printf("📁 LOIC installed at: %s\n", loicDir)
+					fmt.Printf("📄 Executable: %s\n", exe)
+					fmt.Printf("\nRun with: go run loic.go run\n")
+					success = true
+					break
+				}
 			}
+			fmt.Println("⚠️  Installation completed but no executable found")
 		} else {
 			fmt.Printf("❌ Method failed: %v\n", err)
 		}
 	}
 	
-	fmt.Println("\n❌ All installation methods failed")
-	fmt.Println("\nManual installation steps:")
-	fmt.Println("1. Install mono: pkg install mono (Termux) or apt-get install mono-devel (Linux)")
-	fmt.Println("2. Clone repository: git clone https://github.com/NewEraCracker/LOIC.git")
-	fmt.Println("3. Try compiling: cd LOIC/src && mcs -target:winexe -out:LOIC.exe *.cs -r:System.Windows.Forms.dll")
+	if !success {
+		fmt.Println("\n❌ All installation methods failed")
+		fmt.Println("\nManual installation steps:")
+		fmt.Println("1. Clean existing installation: go run loic.go clean")
+		fmt.Println("2. Install mono: pkg install mono (Termux) or apt-get install mono-devel (Linux)")
+		fmt.Println("3. Clone repository: git clone https://github.com/NewEraCracker/LOIC.git")
+		fmt.Println("4. Try compiling: cd LOIC/LOIC/src && mcs -target:winexe -out:LOIC.exe *.cs -r:System.Windows.Forms.dll")
+		fmt.Println("5. Or use alternative tools like hping3 for network testing")
+	}
 }
 
 func runLOIC() {
@@ -547,6 +650,7 @@ func runLOIC() {
 		{"mono", filepath.Base(exePath)},
 	}
 	
+	ran := false
 	for _, cmd := range commands {
 		fmt.Printf("Running: %s\n", strings.Join(cmd, " "))
 		execCmd := exec.Command(cmd[0], cmd[1:]...)
@@ -554,8 +658,13 @@ func runLOIC() {
 		execCmd.Stderr = os.Stderr
 		
 		if err := execCmd.Run(); err == nil {
+			ran = true
 			break
 		}
+	}
+	
+	if !ran {
+		fmt.Println("❌ Failed to run LOIC. Please check the executable.")
 	}
 	
 	// Return to original directory
@@ -565,20 +674,27 @@ func runLOIC() {
 func updateLOIC() {
 	fmt.Println("Updating LOIC...")
 	
-	if isLOIC() {
-		if _, err := os.Stat(filepath.Join(loicDir, ".git")); err == nil {
-			fmt.Println("Pulling latest changes...")
-			os.Chdir(loicDir)
+	// Check various git locations
+	gitDirs := []string{loicDir, filepath.Join(loicDir, "LOIC")}
+	found := false
+	
+	for _, dir := range gitDirs {
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			fmt.Printf("Pulling latest changes from %s...\n", dir)
+			os.Chdir(dir)
 			runCommand("git", "pull", "--rebase")
 			os.Chdir(homeDir)
-			
-			fmt.Println("Recompiling...")
-			compileLOIC()
-			return
+			found = true
+			break
 		}
 	}
 	
-	fmt.Println("LOIC not found in git repository. Reinstalling...")
-	os.RemoveAll(loicDir)
-	installLOIC()
+	if found {
+		fmt.Println("Recompiling...")
+		compileLOIC()
+	} else {
+		fmt.Println("LOIC not found in git repository. Reinstalling...")
+		os.RemoveAll(loicDir)
+		installLOIC()
+	}
 }
